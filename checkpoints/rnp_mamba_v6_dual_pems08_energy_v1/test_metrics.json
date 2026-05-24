@@ -1,0 +1,72 @@
+{
+  "best_epoch": 93,
+  "best_val_mae": 14.536279678344727,
+  "test": {
+    "MAE": 14.417756080627441,
+    "RMSE": 23.458663940429688,
+    "MAPE": 0.09380360692739487
+  },
+  "test_horizons": {
+    "h3": {
+      "MAE": 13.539647102355957,
+      "RMSE": 21.810754776000977,
+      "MAPE": 0.08743070811033249
+    },
+    "h6": {
+      "MAE": 14.392619132995605,
+      "RMSE": 23.432546615600586,
+      "MAPE": 0.09345834702253342
+    },
+    "h12": {
+      "MAE": 15.83067512512207,
+      "RMSE": 25.78095817565918,
+      "MAPE": 0.10392806679010391
+    }
+  },
+  "gate_stats": {
+    "fusion_mode": "rnp_v6_dual_branch",
+    "gate_mean": 0.738206148147583,
+    "gate_std": 0.06610053032636642,
+    "gate_min": 0.2602066099643707,
+    "gate_max": 0.757209062576294,
+    "base_gate_mean": 0.9619787931442261,
+    "energy_gate_mean": 0.5144334435462952,
+    "x_rec_std": 0.5319356322288513,
+    "x_non_std": 0.12015033513307571,
+    "rec_gate_mean": 0.1617187261581421,
+    "rec_gate_min": 0.05000000074505806,
+    "rec_gate_max": 0.6347392201423645,
+    "scale_weight_mean": 0.3333333134651184,
+    "proto_scale": 0.3677075505256653,
+    "lambda_adp": 0.5,
+    "lambda_dyn": 0.5,
+    "lambda_self": 0.5,
+    "lambda_phy": null,
+    "ts_gate_mean": 0.28650718927383423,
+    "ts_gate_min": 0.05323135852813721,
+    "ts_gate_max": 0.4976140856742859,
+    "component_scale": 0.21491597592830658,
+    "component_horizon_scale_mean": 0.7339075803756714,
+    "component_horizon_scale_min": 0.7147781252861023,
+    "component_horizon_scale_max": 0.7490727305412292,
+    "residual_gain_mean": 0.11643608659505844,
+    "residual_gain_max": 0.12190113216638565,
+    "y_rec_std": 0.40489253401756287,
+    "y_non_std": 1.1058404445648193,
+    "y_hat_std": 0.4667520821094513,
+    "correction_abs_mean": 0.46442341804504395,
+    "correction_std": 0.14309661090373993,
+    "rec_identity_scale": 0.6596361994743347,
+    "non_identity_scale": 0.15387976169586182,
+    "spatial_gamma": 0.09314075112342834,
+    "disable_rec": 0.0,
+    "disable_nonrec": 0.0,
+    "topk": 8.0,
+    "spatial_mode": "local_graph_mamba",
+    "spatial_time_mode": "summary",
+    "spatial_bidirectional": 0.0,
+    "disable_temporal_mamba": 0.0,
+    "disable_spatial_mamba": 0.0,
+    "disable_dynamic_graph": 0.0
+  }
+}

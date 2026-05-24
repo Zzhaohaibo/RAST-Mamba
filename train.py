@@ -1,0 +1,574 @@
+import os
+import json
+import argparse
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import Adam
+from torch.optim.lr_scheduler import MultiStepLR
+from tqdm import tqdm
+
+from data.pems_dataset import build_datasets
+from models.rnp_mamba import RNPMambaV6DualBranch, RNPMambaV62Lite
+from utils.scaler import StandardScaler
+from utils.metrics import masked_mae, masked_mae_with_raw_mask, compute_all_metrics
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def load_training_checkpoint(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def build_loaders(args, scaler):
+    train_set, val_set, test_set = build_datasets(
+        data_dir=args.data_dir,
+        scaler=scaler,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        points_per_day=args.points_per_day,
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader, test_loader, train_set
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, args):
+    model.train()
+
+    total_loss = 0.0
+    total_main_loss = 0.0
+    total_aux_loss = 0.0
+    total_batches = 0
+
+    pbar = tqdm(loader, ncols=120)
+    for x, y_norm, x_ts, y_ts, y_raw in pbar:
+        x = x.to(device)
+        y_norm = y_norm.to(device)
+        x_ts = x_ts.to(device)
+        y_raw = y_raw.to(device)
+
+        optimizer.zero_grad()
+
+        pred_norm = model(x, x_ts)
+
+        if args.loss_scale == "raw":
+            # Train on the same raw scale used by validation/test metrics.
+            pred_raw = scaler.inverse_transform_tensor(pred_norm)
+            loss = masked_mae(pred_raw, y_raw, null_val=args.null_val)
+        else:
+            # Backward-compatible default: loss in normalized space, mask from raw labels.
+            loss = masked_mae_with_raw_mask(
+                pred_norm,
+                y_norm,
+                y_raw,
+                null_val=args.null_val,
+            )
+
+        main_loss = loss
+        aux_loss = pred_norm.new_tensor(0.0)
+        if (
+            args.rnp_aux_nonrec_weight > 0
+            and args.model in ("rnp_mamba_v6_dual", "rnp_mamba_v62_lite")
+            and hasattr(model, "get_component_outputs")
+        ):
+            comp = model.get_component_outputs()
+            correction = comp.get("correction") if comp is not None else None
+            y_rec = comp.get("y_rec") if comp is not None else None
+            if correction is not None and y_rec is not None:
+                y_rec_target = y_rec.detach() if args.rnp_aux_detach_rec else y_rec
+                target_correction = y_norm - y_rec_target
+                aux_loss = masked_mae_with_raw_mask(
+                    correction,
+                    target_correction,
+                    y_raw,
+                    null_val=args.null_val,
+                )
+                loss = main_loss + args.rnp_aux_nonrec_weight * aux_loss
+
+        loss.backward()
+
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_main_loss += main_loss.item()
+        total_aux_loss += aux_loss.item()
+        total_batches += 1
+        if args.rnp_aux_nonrec_weight > 0:
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                main=f"{main_loss.item():.4f}",
+                aux=f"{aux_loss.item():.4f}",
+            )
+        else:
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+    avg_loss = total_loss / max(total_batches, 1)
+    if args.rnp_aux_nonrec_weight > 0:
+        avg_main = total_main_loss / max(total_batches, 1)
+        avg_aux = total_aux_loss / max(total_batches, 1)
+        print(f"train/main_loss={avg_main:.6f}, train/nonrec_aux_loss={avg_aux:.6f}")
+    return avg_loss
+
+
+@torch.no_grad()
+def evaluate(model, loader, scaler, device, args):
+    model.eval()
+
+    if hasattr(model, "reset_gate_stats"):
+        model.reset_gate_stats()
+
+    preds_raw = []
+    labels_raw = []
+
+    for x, y_norm, x_ts, y_ts, y_raw in loader:
+        x = x.to(device)
+        x_ts = x_ts.to(device)
+        y_norm = y_norm.to(device)
+
+        pred_norm = model(x, x_ts)
+
+        pred_raw = scaler.inverse_transform_tensor(pred_norm)
+
+        # Use exact raw labels from dataset.
+        # Do not use inverse_transform(y_norm), otherwise zeros may become tiny nonzero values
+        # and MAPE will explode.
+        label_raw = y_raw.to(device)
+
+        preds_raw.append(pred_raw.detach().cpu())
+        labels_raw.append(label_raw.detach().cpu())
+
+    preds = torch.cat(preds_raw, dim=0)
+    labels = torch.cat(labels_raw, dim=0)
+
+    avg_metrics = compute_all_metrics(preds, labels, null_val=args.null_val)
+
+    horizon_metrics = {}
+    for h in args.eval_horizons:
+        if h <= preds.shape[1]:
+            horizon_metrics[f"h{h}"] = compute_all_metrics(
+                preds[:, h - 1:h, :],
+                labels[:, h - 1:h, :],
+                null_val=args.null_val,
+            )
+
+    return avg_metrics, horizon_metrics
+
+
+def print_metrics(prefix, avg_metrics, horizon_metrics=None):
+    msg = (
+        f"{prefix}: "
+        f"MAE={avg_metrics['MAE']:.4f}, "
+        f"RMSE={avg_metrics['RMSE']:.4f}, "
+        f"MAPE={avg_metrics['MAPE']:.4f}"
+    )
+    print(msg)
+
+    if horizon_metrics:
+        for h, m in horizon_metrics.items():
+            print(
+                f"{prefix}@{h}: "
+                f"MAE={m['MAE']:.4f}, "
+                f"RMSE={m['RMSE']:.4f}, "
+                f"MAPE={m['MAPE']:.4f}"
+            )
+
+
+def _format_stat(value):
+    if value is None:
+        return "None"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def print_gate_stats(prefix, gate_stats):
+    if gate_stats is None:
+        return
+
+    keys = [
+        "fusion_mode",
+        "gate_mean",
+        "gate_std",
+        "gate_min",
+        "gate_max",
+        "base_gate_mean",
+        "energy_gate_mean",
+        "x_rec_std",
+        "x_non_std",
+        "rec_gate_mean",
+        "rec_gate_min",
+        "rec_gate_max",
+        "scale_weight_mean",
+        "proto_scale",
+        "lambda_adp",
+        "lambda_dyn",
+        "lambda_self",
+        "lambda_phy",
+        "ts_gate_mean",
+        "ts_gate_max",
+        "component_scale",
+        "component_horizon_scale_mean",
+        "residual_gain_mean",
+        "residual_gain_max",
+        "correction_abs_mean",
+        "correction_std",
+        "y_rec_std",
+        "y_non_std",
+        "y_hat_std",
+        "rec_identity_scale",
+        "non_identity_scale",
+        "spatial_gamma",
+        "spatial_time_mode",
+        "spatial_bidirectional",
+        "lite_scale_weight_mean",
+        "lite_scale_weight_0",
+        "lite_scale_weight_1",
+        "lite_scale_weight_2",
+        "lite_spatial_alpha",
+        "lite_y_non_std",
+        "lite_z_t_std",
+        "lite_z_s_std",
+        "lite_z_non_std",
+        "lite_non_identity_scale",
+    ]
+    msg = ", ".join(f"{k}={_format_stat(gate_stats.get(k))}" for k in keys)
+    print(f"{prefix}/gate_stats: {msg}")
+
+
+def warn_about_v6_config(args):
+    if args.model not in ("rnp_mamba_v6_dual", "rnp_mamba_v62_lite"):
+        return
+
+    warnings = []
+    if args.lr > 0.0015:
+        warnings.append(f"lr={args.lr:g} is aggressive for v6; 0.001 is safer.")
+    if args.loss_scale != "raw":
+        warnings.append("loss_scale=norm differs from validation/test scale; raw matched the stronger v5 run.")
+    if 1 in args.milestones:
+        warnings.append("milestones contains 1, so LR decays after the first epoch.")
+    if args.gamma > 0.2:
+        warnings.append(f"gamma={args.gamma:g} is a large LR drop; 0.1 matched the stronger v5 run.")
+    if args.rnp_residual_scale_init > 0.4:
+        warnings.append(
+            f"rnp_residual_scale_init={args.rnp_residual_scale_init:g} starts non-recurring correction too strong; use 0.2-0.3 first."
+        )
+    if args.rnp_residual_scale_init <= 0.1 and args.rnp_residual_gate_bias_init <= -0.8:
+        warnings.append("residual scale and gate bias are both conservative; non-recurring correction may be under-used.")
+    if args.rnp_aux_nonrec_weight <= 0:
+        warnings.append("non-recurring branch has no component residual supervision; use --rnp_aux_nonrec_weight 0.05 first.")
+
+    if warnings:
+        print("[Config warning] RNP-Mamba v6-family models are sensitive to residual/optimizer settings:")
+        for item in warnings:
+            print("  -", item)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--model', type=str, default='rnp_mamba_v6_dual', choices=['rnp_mamba_v6_dual', 'rnp_mamba_v62_lite'])
+
+    parser.add_argument("--data_dir", type=str, default="/root/autodl-tmp/BasicTS/datasets/PEMS08")
+    parser.add_argument("--save_dir", type=str, default="checkpoints/rnp_mamba_v6_dual_pems08")
+
+    parser.add_argument("--input_len", type=int, default=12)
+    parser.add_argument("--output_len", type=int, default=12)
+    parser.add_argument("--points_per_day", type=int, default=288)
+
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=15)
+
+    parser.add_argument("--lr", type=float, default=0.002)
+    parser.add_argument("--weight_decay", type=float, default=0.0001)
+    parser.add_argument("--milestones", type=int, nargs="+", default=[1, 50, 80])
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument("--loss_scale", type=str, default="norm", choices=["norm", "raw"])
+
+    parser.add_argument("--dropout", type=float, default=0.15)
+    parser.add_argument("--rnp_d_model", type=int, default=64)
+    parser.add_argument("--rnp_d_state", type=int, default=16)
+    parser.add_argument("--rnp_d_conv", type=int, default=2)
+    parser.add_argument("--rnp_expand", type=int, default=1)
+    parser.add_argument("--rnp_head_layers", type=int, default=3)
+    parser.add_argument("--rnp_decomp_kernel", type=int, default=5)
+    parser.add_argument("--rnp_decomp_mode", type=str, default="st_embed", choices=["st_embed", "multi_ma", "multi_ema", "ma_plus_periodic", "none"])
+    parser.add_argument("--rnp_spatial_topk", type=int, default=8)
+    parser.add_argument("--rnp_spatial_node_dim", type=int, default=16)
+    parser.add_argument("--rnp_spatial_mode", type=str, default="local_graph_mamba", choices=["local_graph_mamba", "node_order_mamba", "none"])
+    parser.add_argument("--rnp_spatial_time_mode", type=str, default="summary", choices=["summary", "all"])
+    parser.add_argument("--rnp_spatial_bidirectional", action="store_true")
+    parser.add_argument("--rnp_disable_nonrec", action="store_true")
+    parser.add_argument("--rnp_disable_rec", action="store_true")
+    parser.add_argument("--rnp_disable_temporal_mamba", action="store_true")
+    parser.add_argument("--rnp_disable_spatial_mamba", action="store_true")
+    parser.add_argument("--rnp_disable_dynamic_graph", action="store_true")
+    parser.add_argument("--rnp_residual_scale_init", type=float, default=0.2)
+    parser.add_argument("--rnp_residual_gate_bias_init", type=float, default=-0.6)
+    parser.add_argument("--rnp_use_component_energy_gate", type=int, default=0)
+    parser.add_argument("--rnp_component_energy_weight", type=float, default=0.0)
+    parser.add_argument("--rnp_aux_nonrec_weight", type=float, default=0.05)
+    parser.add_argument("--rnp_aux_detach_rec", type=int, default=1)
+    parser.add_argument("--rnp_use_decomp_context", type=int, default=1)
+    parser.add_argument("--rnp_stid_embed_dim", type=int, default=32)
+    parser.add_argument("--rnp_stid_layers", type=int, default=3)
+    parser.add_argument("--rnp_residual_head_layers", type=int, default=1)
+    parser.add_argument("--node_dim", type=int, default=32)
+    parser.add_argument("--tid_dim", type=int, default=32)
+    parser.add_argument("--diw_dim", type=int, default=32)
+
+    parser.add_argument("--null_val", type=float, default=0.0)
+    parser.add_argument("--eval_horizons", type=int, nargs="+", default=[3, 6, 12])
+
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--device", type=str, default="cuda:0")
+
+    args = parser.parse_args()
+    warn_about_v6_config(args)
+
+    set_seed(args.seed)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("[Warning] CUDA is not available. Fallback to CPU.")
+        args.device = "cpu"
+
+    device = torch.device(args.device)
+
+    print("=" * 80)
+    print("Lightweight traffic forecasting framework")
+    print("model:", args.model)
+    print("data_dir:", args.data_dir)
+    print("device:", device)
+    print("input_len:", args.input_len)
+    print("output_len:", args.output_len)
+    print("epochs:", args.epochs)
+    print("batch_size:", args.batch_size)
+    print("=" * 80)
+
+    train_data_path = os.path.join(args.data_dir, "train_data.npy")
+    if not os.path.exists(train_data_path):
+        raise FileNotFoundError(f"Cannot find {train_data_path}")
+
+    train_data = np.load(train_data_path).astype(np.float32)
+    if train_data.ndim == 3 and train_data.shape[-1] == 1:
+        train_data = train_data[..., 0]
+    if train_data.ndim != 2:
+        raise ValueError(f"Expected train_data shape [T, N], got {train_data.shape}")
+
+    scaler = StandardScaler().fit(train_data)
+    num_nodes = train_data.shape[1]
+
+    print("train_data shape:", train_data.shape)
+    print("num_nodes:", num_nodes)
+    print("scaler mean shape:", scaler.mean.shape)
+    print("scaler std shape:", scaler.std.shape)
+
+    train_loader, val_loader, test_loader, train_set = build_loaders(args, scaler)
+
+    if args.model == "rnp_mamba_v6_dual":
+        model = RNPMambaV6DualBranch(
+            num_nodes=num_nodes,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            d_model=args.rnp_d_model,
+            decomp_kernel=args.rnp_decomp_kernel,
+            d_state=args.rnp_d_state,
+            d_conv=args.rnp_d_conv,
+            expand=args.rnp_expand,
+            dropout=args.dropout,
+            node_dim=args.node_dim,
+            temp_dim_tid=args.tid_dim,
+            temp_dim_diw=args.diw_dim,
+            time_of_day_size=args.points_per_day,
+            day_of_week_size=7,
+            spatial_topk=args.rnp_spatial_topk,
+            spatial_node_dim=args.rnp_spatial_node_dim,
+            rec_head_layers=args.rnp_head_layers,
+            non_head_layers=args.rnp_residual_head_layers,
+            residual_scale_init=args.rnp_residual_scale_init,
+            residual_gate_bias_init=args.rnp_residual_gate_bias_init,
+            decomp_mode=args.rnp_decomp_mode,
+            disable_nonrec=args.rnp_disable_nonrec,
+            disable_rec=args.rnp_disable_rec,
+            disable_temporal_mamba=args.rnp_disable_temporal_mamba,
+            disable_spatial_mamba=args.rnp_disable_spatial_mamba,
+            disable_dynamic_graph=args.rnp_disable_dynamic_graph,
+            spatial_mode=args.rnp_spatial_mode,
+            spatial_time_mode=args.rnp_spatial_time_mode,
+            spatial_bidirectional=args.rnp_spatial_bidirectional,
+            use_component_energy_gate=bool(args.rnp_use_component_energy_gate),
+            component_energy_weight=args.rnp_component_energy_weight,
+        ).to(device)
+
+    elif args.model == "rnp_mamba_v62_lite":
+        model = RNPMambaV62Lite(
+            num_nodes=num_nodes,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            d_model=args.rnp_d_model,
+            decomp_kernel=args.rnp_decomp_kernel,
+            d_state=args.rnp_d_state,
+            d_conv=args.rnp_d_conv,
+            expand=args.rnp_expand,
+            dropout=args.dropout,
+            node_dim=args.node_dim,
+            temp_dim_tid=args.tid_dim,
+            temp_dim_diw=args.diw_dim,
+            time_of_day_size=args.points_per_day,
+            day_of_week_size=7,
+            spatial_topk=args.rnp_spatial_topk,
+            spatial_node_dim=args.rnp_spatial_node_dim,
+            rec_head_layers=args.rnp_head_layers,
+            non_head_layers=args.rnp_residual_head_layers,
+            residual_scale_init=args.rnp_residual_scale_init,
+            residual_gate_bias_init=args.rnp_residual_gate_bias_init,
+            decomp_mode=args.rnp_decomp_mode,
+            disable_nonrec=args.rnp_disable_nonrec,
+            disable_rec=args.rnp_disable_rec,
+            disable_temporal_mamba=args.rnp_disable_temporal_mamba,
+            disable_spatial_mamba=args.rnp_disable_spatial_mamba,
+            disable_dynamic_graph=args.rnp_disable_dynamic_graph,
+            spatial_mode=args.rnp_spatial_mode,
+            spatial_time_mode=args.rnp_spatial_time_mode,
+            spatial_bidirectional=args.rnp_spatial_bidirectional,
+        ).to(device)
+
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
+
+    print(model)
+    print("Trainable parameters:", count_parameters(model))
+
+    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = MultiStepLR(optimizer, milestones=args.milestones, gamma=args.gamma)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = save_dir / "best.pt"
+
+    best_val_mae = float("inf")
+    best_epoch = -1
+    bad_count = 0
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
+        print(f"lr: {optimizer.param_groups[0]['lr']:.6g}")
+
+        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, args)
+        val_metrics, val_horizon_metrics = evaluate(model, val_loader, scaler, device, args)
+
+        print(f"train/loss_norm={train_loss:.6f}")
+        print_metrics("val", val_metrics, val_horizon_metrics)
+
+        if hasattr(model, "get_gate_stats"):
+            gate_stats = model.get_gate_stats()
+            print_gate_stats("val", gate_stats)
+
+        val_mae = val_metrics["MAE"]
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_epoch = epoch
+            bad_count = 0
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "args": vars(args),
+                    "best_val_mae": best_val_mae,
+                    "scaler_mean": scaler.mean,
+                    "scaler_std": scaler.std,
+                },
+                best_ckpt_path,
+            )
+            print(f"Saved best checkpoint to {best_ckpt_path}")
+        else:
+            bad_count += 1
+            print(f"No improvement. bad_count={bad_count}/{args.patience}")
+
+        scheduler.step()
+
+        if bad_count >= args.patience:
+            print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch}")
+            break
+
+    print("\nLoading best checkpoint for final test:", best_ckpt_path)
+    ckpt = load_training_checkpoint(best_ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    test_metrics, test_horizon_metrics = evaluate(model, test_loader, scaler, device, args)
+
+    print("\nFinal test results:")
+    print_metrics("test", test_metrics, test_horizon_metrics)
+
+    gate_stats = None
+    if hasattr(model, "get_gate_stats"):
+        gate_stats = model.get_gate_stats()
+        print_gate_stats("test", gate_stats)
+
+    result = {
+        "best_epoch": best_epoch,
+        "best_val_mae": best_val_mae,
+        "test": test_metrics,
+        "test_horizons": test_horizon_metrics,
+        "gate_stats": gate_stats,
+    }
+
+    with open(save_dir / "test_metrics.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    print("Saved metrics to:", save_dir / "test_metrics.json")
+
+# what
+if __name__ == "__main__":
+    main()

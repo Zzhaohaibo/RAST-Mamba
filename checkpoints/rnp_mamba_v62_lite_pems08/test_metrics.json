@@ -1,0 +1,83 @@
+{
+  "best_epoch": 85,
+  "best_val_mae": 14.614213943481445,
+  "test": {
+    "MAE": 14.537555694580078,
+    "RMSE": 23.823474884033203,
+    "MAPE": 0.09434878081083298
+  },
+  "test_horizons": {
+    "h3": {
+      "MAE": 13.656698226928711,
+      "RMSE": 22.060283660888672,
+      "MAPE": 0.08791183680295944
+    },
+    "h6": {
+      "MAE": 14.535423278808594,
+      "RMSE": 23.82071304321289,
+      "MAPE": 0.09402333945035934
+    },
+    "h12": {
+      "MAE": 15.890976905822754,
+      "RMSE": 26.229684829711914,
+      "MAPE": 0.1045885905623436
+    }
+  },
+  "gate_stats": {
+    "fusion_mode": "rnp_v62_lite",
+    "gate_mean": 0.28582197427749634,
+    "gate_std": 0.11879435926675797,
+    "gate_min": 0.09802184998989105,
+    "gate_max": 0.9971524477005005,
+    "base_gate_mean": 0.28582197427749634,
+    "energy_gate_mean": null,
+    "x_rec_std": 0.42015019059181213,
+    "x_non_std": 0.15267020463943481,
+    "rec_gate_mean": 0.6895580291748047,
+    "rec_gate_min": 0.16789884865283966,
+    "rec_gate_max": 0.9484283924102783,
+    "scale_weight_mean": null,
+    "proto_scale": null,
+    "lambda_adp": 0.5,
+    "lambda_dyn": 0.5,
+    "lambda_self": 0.5,
+    "lambda_phy": null,
+    "ts_gate_mean": null,
+    "ts_gate_min": null,
+    "ts_gate_max": null,
+    "component_scale": 0.23372909426689148,
+    "component_horizon_scale_mean": 0.7163548469543457,
+    "component_horizon_scale_min": 0.6837251782417297,
+    "component_horizon_scale_max": 0.7534711360931396,
+    "residual_gain_mean": 0.04787148907780647,
+    "residual_gain_max": 0.17541678249835968,
+    "y_rec_std": 0.5278594493865967,
+    "y_non_std": 2.0697078704833984,
+    "y_hat_std": 0.47156256437301636,
+    "correction_abs_mean": 0.1093069463968277,
+    "correction_std": 0.10319552570581436,
+    "rec_identity_scale": 0.6288087368011475,
+    "non_identity_scale": 0.1837107390165329,
+    "spatial_gamma": 0.10972107946872711,
+    "lite_scale_weight_mean": 0.3333333432674408,
+    "lite_scale_weight_0": 0.32360973954200745,
+    "lite_scale_weight_1": 0.3194541037082672,
+    "lite_scale_weight_2": 0.35693615674972534,
+    "lite_spatial_alpha": 0.1409386843442917,
+    "lite_y_non_std": 2.0697078704833984,
+    "lite_z_t_std": 0.28091344237327576,
+    "lite_z_s_std": 0.6350299119949341,
+    "lite_z_non_std": 0.8869337439537048,
+    "lite_non_identity_scale": 0.1837107390165329,
+    "disable_rec": 0.0,
+    "disable_nonrec": 0.0,
+    "disable_temporal_mamba": 1.0,
+    "decomp_mode": "st_embed",
+    "topk": 8.0,
+    "spatial_mode": "local_graph_mamba",
+    "spatial_time_mode": "summary",
+    "spatial_bidirectional": 0.0,
+    "disable_spatial_mamba": 0.0,
+    "disable_dynamic_graph": 0.0
+  }
+}

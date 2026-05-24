@@ -1,0 +1,73 @@
+{
+  "best_epoch": 76,
+  "best_val_mae": 14.484726905822754,
+  "test": {
+    "MAE": 14.34360408782959,
+    "RMSE": 23.554813385009766,
+    "MAPE": 0.093068428337574
+  },
+  "test_horizons": {
+    "h3": {
+      "MAE": 13.440423011779785,
+      "RMSE": 21.814592361450195,
+      "MAPE": 0.08669833093881607
+    },
+    "h6": {
+      "MAE": 14.321202278137207,
+      "RMSE": 23.526554107666016,
+      "MAPE": 0.09287038445472717
+    },
+    "h12": {
+      "MAE": 15.758913040161133,
+      "RMSE": 26.04836082458496,
+      "MAPE": 0.10295354574918747
+    }
+  },
+  "gate_stats": {
+    "fusion_mode": "rnp_v6_dual_branch",
+    "gate_mean": 0.32389190793037415,
+    "gate_std": 0.03656911477446556,
+    "gate_min": 0.06644443422555923,
+    "gate_max": 0.6830831170082092,
+    "base_gate_mean": 0.32389190793037415,
+    "energy_gate_mean": null,
+    "x_rec_std": 0.2677887976169586,
+    "x_non_std": 0.3198836147785187,
+    "rec_gate_mean": 0.4071914851665497,
+    "rec_gate_min": 0.05212013050913811,
+    "rec_gate_max": 0.9389299750328064,
+    "scale_weight_mean": null,
+    "proto_scale": null,
+    "lambda_adp": 0.5,
+    "lambda_dyn": 0.5,
+    "lambda_self": 0.5,
+    "lambda_phy": null,
+    "ts_gate_mean": 0.2040402889251709,
+    "ts_gate_min": 0.13566014170646667,
+    "ts_gate_max": 0.2541554272174835,
+    "component_scale": 0.9876766204833984,
+    "component_horizon_scale_mean": 0.7193505167961121,
+    "component_horizon_scale_min": 0.6993516087532043,
+    "component_horizon_scale_max": 0.7436095476150513,
+    "residual_gain_mean": 0.23027969896793365,
+    "residual_gain_max": 0.47918185591697693,
+    "y_rec_std": 0.4641760289669037,
+    "y_non_std": 0.6087331771850586,
+    "y_hat_std": 0.47975954413414,
+    "correction_abs_mean": 0.2631515860557556,
+    "correction_std": 0.16069269180297852,
+    "rec_identity_scale": 0.6104573011398315,
+    "non_identity_scale": 0.1853066384792328,
+    "spatial_gamma": 0.11251015961170197,
+    "disable_rec": 0.0,
+    "disable_nonrec": 0.0,
+    "decomp_mode": "st_embed",
+    "topk": 8.0,
+    "spatial_mode": "local_graph_mamba",
+    "spatial_time_mode": "summary",
+    "spatial_bidirectional": 0.0,
+    "disable_temporal_mamba": 0.0,
+    "disable_spatial_mamba": 0.0,
+    "disable_dynamic_graph": 0.0
+  }
+}
