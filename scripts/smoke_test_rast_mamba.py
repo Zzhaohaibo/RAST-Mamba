@@ -27,6 +27,9 @@ def main():
     x_ts = torch.zeros(B, T, 2).long()
     x_ts[..., 0] = torch.arange(T).view(1, T).expand(B, T) % 288
     x_ts[..., 1] = 0
+    y_ts = torch.zeros(B, H, 2).long()
+    y_ts[..., 0] = (torch.arange(T, T + H).view(1, H).expand(B, H)) % 288
+    y_ts[..., 1] = 0
 
     model = RASTMamba(
         num_nodes=N,
@@ -44,7 +47,7 @@ def main():
         fallback_mlp=True,
     )
 
-    y = model(x, x_ts)
+    y = model(x, x_ts, y_ts=y_ts)
     assert y.shape == (B, H, N), f"Expected output shape {(B, H, N)}, got {tuple(y.shape)}"
 
     loss = y.mean()

@@ -85,11 +85,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args):
         x = x.to(device)
         y_norm = y_norm.to(device)
         x_ts = x_ts.to(device)
+        y_ts = y_ts.to(device)
         y_raw = y_raw.to(device)
 
         optimizer.zero_grad()
 
-        pred_norm = model(x, x_ts)
+        pred_norm = model(x, x_ts, y_ts=y_ts)
 
         if args.loss_scale == "raw":
             # Train on the same raw scale used by validation/test metrics.
@@ -132,9 +133,10 @@ def evaluate(model, loader, scaler, device, args):
     for x, y_norm, x_ts, y_ts, y_raw in loader:
         x = x.to(device)
         x_ts = x_ts.to(device)
+        y_ts = y_ts.to(device)
         y_norm = y_norm.to(device)
 
-        pred_norm = model(x, x_ts)
+        pred_norm = model(x, x_ts, y_ts=y_ts)
 
         pred_raw = scaler.inverse_transform_tensor(pred_norm)
 
@@ -197,10 +199,9 @@ def print_gate_stats(prefix, gate_stats):
 
     keys = [
         "fusion_mode",
-        "role_gate_tem_mean",
-        "role_gate_spa_mean",
-        "role_gate_per_mean",
-        "role_gate_dom_mean",
+        "alpha_spa",
+        "alpha_per",
+        "alpha_dom",
         "lambda_static",
         "lambda_dynamic",
         "lambda_phy",

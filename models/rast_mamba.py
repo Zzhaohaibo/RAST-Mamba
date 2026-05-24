@@ -59,18 +59,19 @@ class SpatioTemporalEmbedding(nn.Module):
         dropout: float = 0.15,
         time_of_day_size: int = 288,
         day_of_week_size: int = 7,
+        embedding_identity_scale: float = 0.1,
     ):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_model = int(d_model)
         self.time_of_day_size = int(time_of_day_size)
         self.day_of_week_size = int(day_of_week_size)
+        self.embedding_identity_scale = float(embedding_identity_scale)
 
         self.value_emb = nn.Linear(1, d_model)
         self.node_emb = nn.Parameter(torch.empty(num_nodes, d_model))
         self.tod_emb = nn.Embedding(time_of_day_size, d_model)
         self.dow_emb = nn.Embedding(day_of_week_size, d_model)
-        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
         nn.init.xavier_uniform_(self.node_emb)
@@ -97,8 +98,8 @@ class SpatioTemporalEmbedding(nn.Module):
         tod = self.tod_emb(tod).unsqueeze(2).expand(-1, -1, N, -1)
         dow = self.dow_emb(dow).unsqueeze(2).expand(-1, -1, N, -1)
 
-        out = value + node + tod + dow
-        return self.dropout(self.norm(out))
+        out = value + self.embedding_identity_scale * (node + tod + dow)
+        return self.dropout(out)
 
 
 class TemporalCausalMambaBranch(nn.Module):
@@ -228,18 +229,7 @@ class SpatialGraphFilteringBranch(nn.Module):
         self.raw_gamma = nn.Parameter(_init_bounded_scale(init_gamma, self.max_gamma))
         self._last_stats: Dict[str, Any] = {}
 
-    def _row_softmax_graph(self, score: torch.Tensor, mask_self: bool = True) -> torch.Tensor:
-        N = score.shape[-1]
-        if N <= 1:
-            return torch.zeros_like(score)
-        if mask_self:
-            eye = torch.eye(N, device=score.device, dtype=torch.bool)
-            if score.dim() == 3:
-                eye = eye.view(1, N, N)
-            score = score.masked_fill(eye, float("-inf"))
-        return torch.softmax(score, dim=-1)
-
-    def _prepare_physical_graph(self, A_phy: torch.Tensor, B: int, N: int, device, dtype):
+    def _prepare_physical_score(self, A_phy: torch.Tensor, B: int, N: int, device, dtype):
         if A_phy is None:
             return None
         if A_phy.dim() == 2:
@@ -252,18 +242,18 @@ class SpatialGraphFilteringBranch(nn.Module):
             raise ValueError(f"A_phy must be [N,N] or [B,N,N], got {tuple(A_phy.shape)}")
         if A_phy.shape != (B, N, N):
             raise ValueError(f"A_phy must be [{B},{N},{N}], got {tuple(A_phy.shape)}")
-        return self._row_softmax_graph(A_phy, mask_self=True)
+        return A_phy
 
-    def _topk_graph(self, A: torch.Tensor):
-        B, N, _ = A.shape
+    def _topk_graph(self, mixed_score: torch.Tensor):
+        B, N, _ = mixed_score.shape
         k = min(self.spatial_topk, max(N - 1, 0))
         if k == 0:
-            topk_idx = torch.empty(B, N, 0, device=A.device, dtype=torch.long)
-            topk_attn = torch.empty(B, N, 0, device=A.device, dtype=A.dtype)
+            topk_idx = torch.empty(B, N, 0, device=mixed_score.device, dtype=torch.long)
+            topk_attn = torch.empty(B, N, 0, device=mixed_score.device, dtype=mixed_score.dtype)
             return topk_idx, topk_attn, k
 
-        eye = torch.eye(N, device=A.device, dtype=torch.bool).view(1, N, N)
-        score = A.masked_fill(eye, float("-inf"))
+        eye = torch.eye(N, device=mixed_score.device, dtype=torch.bool).view(1, N, N)
+        score = mixed_score.masked_fill(eye, float("-inf"))
         topk_val, topk_idx = torch.topk(score, k=k, dim=-1)
         topk_attn = torch.softmax(topk_val, dim=-1)
         return topk_idx, topk_attn, k
@@ -281,27 +271,25 @@ class SpatialGraphFilteringBranch(nn.Module):
         Z = H_tem.mean(dim=1)
 
         static_score = torch.relu(torch.matmul(self.node_emb1, self.node_emb2.transpose(0, 1)))
-        A_static = self._row_softmax_graph(static_score, mask_self=True)
 
         q = self.q_proj(Z)
         k = self.k_proj(Z)
         dynamic_score = torch.einsum("bnd,bmd->bnm", q, k) / math.sqrt(max(q.shape[-1], 1))
-        A_dynamic = self._row_softmax_graph(dynamic_score, mask_self=True)
 
-        A_phy_norm = self._prepare_physical_graph(A_phy, B, N, H_tem.device, H_tem.dtype)
-        if A_phy_norm is None:
+        phy_score = self._prepare_physical_score(A_phy, B, N, H_tem.device, H_tem.dtype)
+        if phy_score is None:
             lambda_static, lambda_dynamic = torch.softmax(self.graph_logits[:2], dim=0)
             lambda_phy = None
-            A = lambda_static * A_static.unsqueeze(0) + lambda_dynamic * A_dynamic
+            mixed_score = lambda_static * static_score.unsqueeze(0) + lambda_dynamic * dynamic_score
         else:
             lambda_static, lambda_dynamic, lambda_phy = torch.softmax(self.graph_logits, dim=0)
-            A = (
-                lambda_static * A_static.unsqueeze(0)
-                + lambda_dynamic * A_dynamic
-                + lambda_phy * A_phy_norm
+            mixed_score = (
+                lambda_static * static_score.unsqueeze(0)
+                + lambda_dynamic * dynamic_score
+                + lambda_phy * phy_score
             )
 
-        topk_idx, topk_attn, effective_topk = self._topk_graph(A)
+        topk_idx, topk_attn, effective_topk = self._topk_graph(mixed_score)
         if effective_topk == 0:
             neighbor_agg = torch.zeros_like(H_tem)
         else:
@@ -471,12 +459,11 @@ class NodeDomainAdapter(nn.Module):
 class RoleAwareGatedFusion(nn.Module):
     """
     Reference:
-    - Earlier local dual-branch code: gated component selection.
-    - Common mixture-of-experts style softmax gating.
+    - Earlier local dual-branch code: bounded component residual scaling.
 
     Migration:
-    The gate is role-aware over four aligned features: temporal, spatial,
-    periodic, and domain. It is not a two-branch y_rec/y_non gate.
+    Temporal Mamba is kept as the backbone. Spatial, periodic, and domain roles
+    contribute bounded residual deltas, avoiding four-way softmax collapse.
 
     Input:
         H_tem, H_spa, H_per, H_dom: [B,T,N,D]
@@ -484,18 +471,13 @@ class RoleAwareGatedFusion(nn.Module):
         H_fuse: [B,T,N,D]
     """
 
-    def __init__(self, d_model: int, dropout: float = 0.15):
+    def __init__(self, d_model: int, dropout: float = 0.15, alpha_init: float = 0.1, alpha_max: float = 0.5):
         super().__init__()
         self.d_model = int(d_model)
-        self.gate_mlp = nn.Sequential(
-            nn.LayerNorm(d_model * 4),
-            nn.Linear(d_model * 4, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 4),
-        )
-        nn.init.zeros_(self.gate_mlp[-1].weight)
-        nn.init.zeros_(self.gate_mlp[-1].bias)
+        self.alpha_max = float(alpha_max)
+        self.raw_alpha_spa = nn.Parameter(_init_bounded_scale(alpha_init, self.alpha_max))
+        self.raw_alpha_per = nn.Parameter(_init_bounded_scale(alpha_init, self.alpha_max))
+        self.raw_alpha_dom = nn.Parameter(_init_bounded_scale(alpha_init, self.alpha_max))
         self.norm = nn.LayerNorm(d_model)
         self._last_stats: Dict[str, Any] = {}
 
@@ -509,26 +491,78 @@ class RoleAwareGatedFusion(nn.Module):
         if H_tem.shape[-1] != self.d_model:
             raise ValueError(f"Expected d_model={self.d_model}, got D={H_tem.shape[-1]}")
 
-        H_cat = torch.cat([H_tem, H_spa, H_per, H_dom], dim=-1)
-        gate = torch.softmax(self.gate_mlp(H_cat), dim=-1)
-        H_fuse = (
-            gate[..., 0:1] * H_tem
-            + gate[..., 1:2] * H_spa
-            + gate[..., 2:3] * H_per
-            + gate[..., 3:4] * H_dom
-        )
+        alpha_spa = _bounded_positive_scale(self.raw_alpha_spa, self.alpha_max).to(dtype=H_tem.dtype)
+        alpha_per = _bounded_positive_scale(self.raw_alpha_per, self.alpha_max).to(dtype=H_tem.dtype)
+        alpha_dom = _bounded_positive_scale(self.raw_alpha_dom, self.alpha_max).to(dtype=H_tem.dtype)
+
+        H_spa_delta = H_spa - H_tem
+        H_per_delta = H_per - H_tem
+        H_dom_delta = H_dom - H_tem
+        H_fuse = H_tem + alpha_spa * H_spa_delta + alpha_per * H_per_delta + alpha_dom * H_dom_delta
         H_fuse = self.norm(H_fuse)
 
         self._last_stats = {
-            "role_gate_tem_mean": gate[..., 0].detach().mean(),
-            "role_gate_spa_mean": gate[..., 1].detach().mean(),
-            "role_gate_per_mean": gate[..., 2].detach().mean(),
-            "role_gate_dom_mean": gate[..., 3].detach().mean(),
+            "alpha_spa": alpha_spa.detach(),
+            "alpha_per": alpha_per.detach(),
+            "alpha_dom": alpha_dom.detach(),
         }
         return H_fuse
 
     def get_stats(self) -> Dict[str, Any]:
         return dict(self._last_stats)
+
+
+class FutureTimeEmbedding(nn.Module):
+    """
+    Reference:
+    - STID: explicit time-of-day/day-of-week embeddings for traffic forecasting.
+    - Earlier local timestamp handling: clamp time indices before embedding lookup.
+
+    Migration:
+    We use only future timestamp identities as a lightweight horizon-specific
+    bias source for the forecast head. This keeps the main RAST-Mamba framework
+    unchanged while making y_ts useful for future time-of-day/day-of-week effects.
+
+    Input:
+        y_ts: [B,H,2]
+    Output:
+        H_future: [B,H,N,D]
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        dropout: float = 0.15,
+        time_of_day_size: int = 288,
+        day_of_week_size: int = 7,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.time_of_day_size = int(time_of_day_size)
+        self.day_of_week_size = int(day_of_week_size)
+
+        self.tod_emb = nn.Embedding(time_of_day_size, d_model)
+        self.dow_emb = nn.Embedding(day_of_week_size, d_model)
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.xavier_uniform_(self.tod_emb.weight)
+        nn.init.xavier_uniform_(self.dow_emb.weight)
+
+    def forward(self, y_ts: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        if y_ts.dim() != 3 or y_ts.shape[-1] < 2:
+            raise ValueError(f"y_ts must be [B,H,2], got {tuple(y_ts.shape)}")
+
+        tod = y_ts[..., 0].long().clamp(0, self.time_of_day_size - 1)
+        dow = y_ts[..., 1].long().clamp(0, self.day_of_week_size - 1)
+        time_feat = self.tod_emb(tod) + self.dow_emb(dow)
+        time_feat = self.dropout(self.proj(time_feat))
+        return time_feat.unsqueeze(2).expand(-1, -1, int(num_nodes), -1)
 
 
 class ForecastHead(nn.Module):
@@ -538,23 +572,46 @@ class ForecastHead(nn.Module):
     - Earlier local STID-style head: output contract [B,H,N].
 
     Migration:
-    For stability, the first RAST-Mamba version uses a simple flatten-linear
-    head instead of a deeper STID Conv2d head.
+    We keep the stable per-node flatten head but strengthen it into a light MLP.
+    Future timestamp embeddings from y_ts add a horizon-aware time bias.
 
     Input:
         H_fuse: [B,T,N,D]
+        y_ts:   [B,H,2] or None
     Output:
         Y_base: [B,H,N]
     """
 
-    def __init__(self, input_len: int, output_len: int, d_model: int):
+    def __init__(
+        self,
+        input_len: int,
+        output_len: int,
+        d_model: int,
+        dropout: float = 0.15,
+        time_of_day_size: int = 288,
+        day_of_week_size: int = 7,
+    ):
         super().__init__()
         self.input_len = int(input_len)
         self.output_len = int(output_len)
         self.d_model = int(d_model)
-        self.proj = nn.Linear(input_len * d_model, output_len)
+        self.proj = nn.Sequential(
+            nn.Linear(input_len * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, output_len),
+        )
+        self.future_time = FutureTimeEmbedding(
+            d_model=d_model,
+            dropout=dropout,
+            time_of_day_size=time_of_day_size,
+            day_of_week_size=day_of_week_size,
+        )
+        self.future_bias = nn.Linear(d_model, 1)
+        nn.init.xavier_uniform_(self.future_bias.weight, gain=0.1)
+        nn.init.zeros_(self.future_bias.bias)
 
-    def forward(self, H_fuse: torch.Tensor) -> torch.Tensor:
+    def forward(self, H_fuse: torch.Tensor, y_ts: torch.Tensor = None) -> torch.Tensor:
         if H_fuse.dim() != 4:
             raise ValueError(f"ForecastHead expects [B,T,N,D], got {tuple(H_fuse.shape)}")
         B, T, N, D = H_fuse.shape
@@ -565,7 +622,17 @@ class ForecastHead(nn.Module):
 
         z = H_fuse.permute(0, 2, 1, 3).contiguous().view(B, N, T * D)
         y = self.proj(z)
-        return y.permute(0, 2, 1).contiguous()
+        y = y.permute(0, 2, 1).contiguous()
+
+        if y_ts is not None:
+            if y_ts.shape[0] != B or y_ts.shape[1] != self.output_len:
+                raise ValueError(
+                    f"y_ts must match forecast batch/horizon [B,{self.output_len},2], got {tuple(y_ts.shape)}"
+                )
+            future = self.future_time(y_ts, N)
+            y = y + self.future_bias(future).squeeze(-1)
+
+        return y
 
 
 class ResidualCorrectionHead(nn.Module):
@@ -591,8 +658,8 @@ class ResidualCorrectionHead(nn.Module):
         input_len: int,
         output_len: int,
         d_model: int,
-        correction_scale_init: float = 0.1,
-        correction_scale_max: float = 0.5,
+        correction_scale_init: float = 0.2,
+        correction_scale_max: float = 0.8,
     ):
         super().__init__()
         self.input_len = int(input_len)
@@ -605,7 +672,7 @@ class ResidualCorrectionHead(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
         self.raw_scale = nn.Parameter(_init_bounded_scale(correction_scale_init, correction_scale_max))
-        self.raw_horizon_scale = nn.Parameter(torch.zeros(output_len))
+        self.raw_horizon_scale = nn.Parameter(_init_bounded_scale(0.75, 1.0).repeat(output_len))
         self._last_stats: Dict[str, Any] = {}
 
     def forward(self, H_fuse: torch.Tensor, Y_base: torch.Tensor) -> torch.Tensor:
@@ -653,7 +720,8 @@ class RASTMamba(nn.Module):
     Mamba only scans along the temporal axis T. Spatial dependency goes through
     graph filtering, periodic/low-frequency structure through a light conv branch,
     and node heterogeneity through a node-aware adapter. Four role features are
-    fused by a softmax gate, followed by base forecast plus weak residual correction.
+    fused as temporal backbone plus bounded residual role deltas, followed by
+    base forecast plus weak residual correction.
 
     Forward flow:
         x      -> [B,T,N]
@@ -682,8 +750,9 @@ class RASTMamba(nn.Module):
         day_of_week_size: int = 7,
         spatial_topk: int = 8,
         spatial_node_dim: int = 16,
-        correction_scale_init: float = 0.1,
-        correction_scale_max: float = 0.5,
+        correction_scale_init: float = 0.2,
+        correction_scale_max: float = 0.8,
+        embedding_identity_scale: float = 0.1,
         fallback_mlp: bool = False,
     ):
         super().__init__()
@@ -698,6 +767,7 @@ class RASTMamba(nn.Module):
             dropout=dropout,
             time_of_day_size=time_of_day_size,
             day_of_week_size=day_of_week_size,
+            embedding_identity_scale=embedding_identity_scale,
         )
         self.temporal_branch = TemporalCausalMambaBranch(
             d_model=d_model,
@@ -725,7 +795,14 @@ class RASTMamba(nn.Module):
         )
         self.domain_adapter = NodeDomainAdapter(num_nodes=num_nodes, d_model=d_model, dropout=dropout)
         self.fusion = RoleAwareGatedFusion(d_model=d_model, dropout=dropout)
-        self.forecast_head = ForecastHead(input_len=input_len, output_len=output_len, d_model=d_model)
+        self.forecast_head = ForecastHead(
+            input_len=input_len,
+            output_len=output_len,
+            d_model=d_model,
+            dropout=dropout,
+            time_of_day_size=time_of_day_size,
+            day_of_week_size=day_of_week_size,
+        )
         self.correction_head = ResidualCorrectionHead(
             input_len=input_len,
             output_len=output_len,
@@ -736,7 +813,13 @@ class RASTMamba(nn.Module):
 
         self._last_stats: Dict[str, Any] = {"fusion_mode": "rast_mamba"}
 
-    def forward(self, x: torch.Tensor, x_ts: torch.Tensor, A_phy: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_ts: torch.Tensor,
+        y_ts: torch.Tensor = None,
+        A_phy: torch.Tensor = None,
+    ) -> torch.Tensor:
         if x.dim() == 4 and x.shape[-1] == 1:
             x = x.squeeze(-1)
         if x.dim() != 3:
@@ -759,7 +842,7 @@ class RASTMamba(nn.Module):
         H_dom = self.domain_adapter(H_tem)
         H_fuse = self.fusion(H_tem, H_spa, H_per, H_dom)
 
-        Y_base = self.forecast_head(H_fuse)
+        Y_base = self.forecast_head(H_fuse, y_ts=y_ts)
         Delta_Y = self.correction_head(H_fuse, Y_base)
         Y_hat = Y_base + Delta_Y
 
@@ -774,10 +857,9 @@ class RASTMamba(nn.Module):
     def get_gate_stats(self) -> Dict[str, Any]:
         stats = {
             "fusion_mode": "rast_mamba",
-            "role_gate_tem_mean": 0.0,
-            "role_gate_spa_mean": 0.0,
-            "role_gate_per_mean": 0.0,
-            "role_gate_dom_mean": 0.0,
+            "alpha_spa": 0.0,
+            "alpha_per": 0.0,
+            "alpha_dom": 0.0,
             "correction_abs_mean": 0.0,
             "correction_std": 0.0,
             "correction_scale": 0.0,
