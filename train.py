@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import pickle
 import random
 from pathlib import Path
 
@@ -33,6 +34,94 @@ def load_training_checkpoint(path, map_location):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value}")
+
+
+def resolve_adjacency_path(data_dir, adj_path=None):
+    if adj_path:
+        path = Path(adj_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Cannot find adjacency file: {path}")
+        return path
+
+    data_dir = Path(data_dir)
+    for name in ("adj_mx.pkl", "adj.npy", "adj_mx.npy"):
+        path = data_dir / name
+        if path.exists():
+            return path
+    return None
+
+
+def _to_numpy_adjacency(value):
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    if hasattr(value, "toarray"):
+        value = value.toarray()
+    return np.asarray(value, dtype=np.float32)
+
+
+def _extract_adjacency_object(obj):
+    if isinstance(obj, np.ndarray) and obj.dtype == object and obj.shape == ():
+        obj = obj.item()
+
+    if isinstance(obj, dict):
+        for key in ("adj_mx", "adj", "adjacency", "adjacency_matrix", "matrix", "A"):
+            if key in obj:
+                return obj[key]
+        for value in obj.values():
+            try:
+                arr = _to_numpy_adjacency(value)
+            except (TypeError, ValueError):
+                continue
+            if arr.ndim == 2:
+                return value
+        raise ValueError("Could not find a 2D adjacency matrix in adjacency dict.")
+
+    if isinstance(obj, (tuple, list)):
+        if len(obj) >= 3:
+            return obj[2]
+        for value in obj:
+            try:
+                arr = _to_numpy_adjacency(value)
+            except (TypeError, ValueError):
+                continue
+            if arr.ndim == 2:
+                return value
+        raise ValueError("Could not find a 2D adjacency matrix in adjacency tuple/list.")
+
+    return obj
+
+
+def load_adjacency(path, num_nodes):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".pkl":
+        with open(path, "rb") as f:
+            try:
+                obj = pickle.load(f)
+            except UnicodeDecodeError:
+                f.seek(0)
+                obj = pickle.load(f, encoding="latin1")
+    elif suffix == ".npy":
+        obj = np.load(path, allow_pickle=True)
+    else:
+        raise ValueError(f"Unsupported adjacency file suffix: {path.suffix}")
+
+    adj = _to_numpy_adjacency(_extract_adjacency_object(obj))
+    expected_shape = (int(num_nodes), int(num_nodes))
+    if adj.shape != expected_shape:
+        raise ValueError(f"Adjacency shape must be {expected_shape}, got {adj.shape} from {path}")
+    return torch.as_tensor(adj, dtype=torch.float32)
 
 
 def build_loaders(args, scaler):
@@ -74,7 +163,7 @@ def build_loaders(args, scaler):
     return train_loader, val_loader, test_loader, train_set
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, args):
+def train_one_epoch(model, loader, optimizer, scaler, device, args, A_phy=None):
     model.train()
 
     total_loss = 0.0
@@ -90,7 +179,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args):
 
         optimizer.zero_grad()
 
-        pred_norm = model(x, x_ts, y_ts=y_ts)
+        pred_norm = model(x, x_ts, y_ts=y_ts, A_phy=A_phy)
 
         if args.loss_scale == "raw":
             # Train on the same raw scale used by validation/test metrics.
@@ -121,7 +210,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args):
 
 
 @torch.no_grad()
-def evaluate(model, loader, scaler, device, args):
+def evaluate(model, loader, scaler, device, args, A_phy=None):
     model.eval()
 
     if hasattr(model, "reset_gate_stats"):
@@ -136,7 +225,7 @@ def evaluate(model, loader, scaler, device, args):
         y_ts = y_ts.to(device)
         y_norm = y_norm.to(device)
 
-        pred_norm = model(x, x_ts, y_ts=y_ts)
+        pred_norm = model(x, x_ts, y_ts=y_ts, A_phy=A_phy)
 
         pred_raw = scaler.inverse_transform_tensor(pred_norm)
 
@@ -247,6 +336,8 @@ def main():
     parser.add_argument("--rnp_expand", type=int, default=1)
     parser.add_argument("--rnp_spatial_topk", type=int, default=8)
     parser.add_argument("--rnp_spatial_node_dim", type=int, default=16)
+    parser.add_argument("--use_adj", type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--adj_path", type=str, default=None)
 
     parser.add_argument("--null_val", type=float, default=0.0)
     parser.add_argument("--eval_horizons", type=int, nargs="+", default=[3, 6, 12])
@@ -273,6 +364,7 @@ def main():
     print("output_len:", args.output_len)
     print("epochs:", args.epochs)
     print("batch_size:", args.batch_size)
+    print("use_adj:", args.use_adj)
     print("=" * 80)
 
     train_data_path = os.path.join(args.data_dir, "train_data.npy")
@@ -292,6 +384,29 @@ def main():
     print("num_nodes:", num_nodes)
     print("scaler mean shape:", scaler.mean.shape)
     print("scaler std shape:", scaler.std.shape)
+
+    A_phy = None
+    resolved_adj_path = None
+    if args.use_adj:
+        resolved_adj_path = resolve_adjacency_path(args.data_dir, args.adj_path)
+        if resolved_adj_path is None:
+            print("adj_path: None (not found under data_dir)")
+            print("A_phy shape: None")
+        else:
+            args.adj_path = str(resolved_adj_path)
+            A_phy = load_adjacency(resolved_adj_path, num_nodes).to(device)
+            print("adj_path:", resolved_adj_path)
+            print("A_phy shape:", tuple(A_phy.shape))
+            print(
+                "A_phy min/max/mean/std:",
+                f"{A_phy.min().item():.6f}",
+                f"{A_phy.max().item():.6f}",
+                f"{A_phy.mean().item():.6f}",
+                f"{A_phy.std(unbiased=False).item():.6f}",
+            )
+    else:
+        print("adj_path: None (--use_adj false)")
+        print("A_phy shape: None")
 
     train_loader, val_loader, test_loader, train_set = build_loaders(args, scaler)
 
@@ -332,8 +447,8 @@ def main():
         print(f"\nEpoch {epoch}/{args.epochs}")
         print(f"lr: {optimizer.param_groups[0]['lr']:.6g}")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, args)
-        val_metrics, val_horizon_metrics = evaluate(model, val_loader, scaler, device, args)
+        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, args, A_phy=A_phy)
+        val_metrics, val_horizon_metrics = evaluate(model, val_loader, scaler, device, args, A_phy=A_phy)
 
         print(f"train/loss_{args.loss_scale}={train_loss:.6f}")
         print_metrics("val", val_metrics, val_horizon_metrics)
@@ -376,7 +491,7 @@ def main():
     ckpt = load_training_checkpoint(best_ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
 
-    test_metrics, test_horizon_metrics = evaluate(model, test_loader, scaler, device, args)
+    test_metrics, test_horizon_metrics = evaluate(model, test_loader, scaler, device, args, A_phy=A_phy)
 
     print("\nFinal test results:")
     print_metrics("test", test_metrics, test_horizon_metrics)

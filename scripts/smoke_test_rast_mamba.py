@@ -30,6 +30,8 @@ def main():
     y_ts = torch.zeros(B, H, 2).long()
     y_ts[..., 0] = (torch.arange(T, T + H).view(1, H).expand(B, H)) % 288
     y_ts[..., 1] = 0
+    A_phy = torch.rand(N, N)
+    A_phy.fill_diagonal_(0.0)
 
     model = RASTMamba(
         num_nodes=N,
@@ -47,7 +49,7 @@ def main():
         fallback_mlp=True,
     )
 
-    y = model(x, x_ts, y_ts=y_ts)
+    y = model(x, x_ts, y_ts=y_ts, A_phy=A_phy)
     assert y.shape == (B, H, N), f"Expected output shape {(B, H, N)}, got {tuple(y.shape)}"
 
     loss = y.mean()
@@ -57,6 +59,7 @@ def main():
     print("parameter count:", count_parameters(model))
     print("backward OK")
     print("gate stats:", model.get_gate_stats())
+    assert model.get_gate_stats()["lambda_phy"] is not None, "Expected lambda_phy when A_phy is provided."
     print("note: fallback_mlp=True is for CPU smoke testing only; formal training uses mamba_ssm.")
 
 
